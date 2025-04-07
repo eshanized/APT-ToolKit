@@ -1,0 +1,84 @@
+# APT Toolkit Configuration - Production Defaults
+# All sensitive values should be overridden in production deployments
+
+core:
+  # Threading and performance
+  max_threads: 10
+  max_processes: 4
+  task_timeout: 3600  # seconds
+  queue_timeout: 30
+  result_ttl: 86400  # 24h in seconds
+
+  # Security controls
+  fail2ban_attempts: 5
+  fail2ban_window: 300  # 5 minutes
+  rate_limit: "100/minute"
+  unsafe_operations: false
+
+logging:
+  level: "INFO"
+  rotation: "100MB"
+  retention: 7  # days
+  sensitive_mask: true
+  audit_log: "/var/log/apt_toolkit/audit.log"
+
+network:
+  # Scanning defaults
+  default_ports: "21-23,25,53,80,110,143,443,445,993,995,3389"
+  scan_speed: "T3"  # nmap timing template
+  packet_timeout: 2.0
+  max_retries: 2
+
+  # Proxy settings
+  proxy_enabled: false
+  proxy_http: ""
+  proxy_https: ""
+  proxy_verify_ssl: true
+
+modules:
+  recon:
+    dns_servers:
+      - "8.8.8.8"
+      - "1.1.1.1"
+    whois_timeout: 10
+    subdomain_bruteforce: false
+
+  bruteforce:
+    max_attempts: 10
+    delay_between_attempts: 1
+    lockout_threshold: 3
+
+  web:
+    xss_test_vectors: ["<script>alert(1)</script>", "javascript:alert(1)"]
+    sql_test_patterns: ["' OR 1=1--", "' UNION SELECT null--"]
+    crawl_depth: 3
+    form_submit_delay: 2
+
+reporting:
+  default_format: "pdf"
+  company_logo: "/opt/apt_toolkit/assets/logo.png"
+  disclaimer: |
+    This report contains sensitive security information.
+    Distribution is restricted to authorized personnel only.
+  classification: "CONFIDENTIAL"
+
+plugins:
+  enabled: false
+  scan_on_install: true
+  allowed_repositories:
+    - "https://plugins.apt-toolkit.example.com/official"
+  signature_required: true
+
+# Sensitive configurations - These MUST be overridden in production
+security:
+  encryption_key: "CHANGE_ME_IN_PRODUCTION"
+  api_keys:
+    shodan: ""
+    virustotal: ""
+  credential_storage: "vault"  # vault|aws_secrets|file
+
+compliance:
+  gdpr: true
+  pci_dss: false
+  hipaa: false
+  report_anonymization: true

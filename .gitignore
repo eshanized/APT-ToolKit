@@ -1,0 +1,83 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# IDE specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build and distribution
+build/
+dist/
+*.egg-info/
+*.egg
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Log files
+logs/
+*.log
+*.log.*
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# PyQt/PySide generated UI files
+*_ui.py
+*.ui.bak
+
+# Project specific ignores
+src/data/  # Any local data storage
+*.session  # Qt session files
+*.prof  # Profiling data
+
+# Wordlists (sample/empty versions should be committed)
+!src/wordlists/*.sample.txt
+
+# PDF reports (generated files)
+*.pdf
+
+# Compiled binaries
+*.so
+*.dll
+*.exe
+
+# Environment variables
+.env
+secrets.ini
+config.ini  # Unless it's a sample config
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# PyCharm
+.idea/
+*.iml
