@@ -1,260 +1,357 @@
 """
-Traffic Analyzer Module for APT Toolkit
+Network Traffic Analyzer Module for APT Toolkit
 
 Features:
 - Packet capture and analysis
-- Protocol decoding (HTTP, DNS, etc.)
-- Traffic statistics
+- Protocol decoding
 - Anomaly detection
-- Thread-safe operation
-- Configurable capture duration
+- Flow analysis
+- Threat intelligence integration
 """
 
-import time
-import threading
-from typing import Dict, List, Optional, Tuple, Any
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from enum import Enum, auto
-import dpkt  # For packet parsing
+import json
+import re
 import socket
-
-from src.core.engine import ScanModule, ScanTarget, ScanResult, ScanStatus
+import asyncio
+from typing import Dict, List, Optional, Tuple, Union, Any
+from dataclasses import dataclass, field
+import time
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+import dpkt
+from src.core.engine import ScanModule, ScanTarget
 from src.utils.logger import get_logger
-from src.utils.network import NetworkHelpers
 from src.utils.config import config
-from src.core.event_system import event_system, Event
+from src.utils.threading_utils import net_pool
+from src.core.event_system import event_system
 
 logger = get_logger(__name__)
 
-class ProtocolType(Enum):
-    """Network protocol types"""
-    HTTP = auto()
-    HTTPS = auto()
-    DNS = auto()
-    TCP = auto()
-    UDP = auto()
-    ICMP = auto()
-    OTHER = auto()
+@dataclass
+class TrafficFlow:
+    """Network flow statistics container"""
+    src_ip: str
+    dst_ip: str
+    src_port: int
+    dst_port: int
+    protocol: str
+    bytes_sent: int = 0
+    bytes_received: int = 0
+    packets_sent: int = 0
+    packets_received: int = 0
+    start_time: float = field(default_factory=time.time)
+    end_time: Optional[float] = None
 
-class TrafficStats:
-    """Traffic statistics container"""
-    
-    def __init__(self):
-        self.packet_count = 0
-        self.byte_count = 0
-        self.protocols = defaultdict(int)
-        self.sources = defaultdict(int)
-        self.destinations = defaultdict(int)
-        self.anomalies = []
+@dataclass
+class ProtocolStats:
+    """Protocol-level statistics"""
+    protocol: str
+    total_bytes: int = 0
+    total_packets: int = 0
+    flows: int = 0
+
+@dataclass
+class TrafficAlert:
+    """Security alert container"""
+    severity: str  # info|warning|critical
+    category: str  # scanning|dos|exfiltration|etc.
+    description: str
+    evidence: Dict[str, Any]
+    timestamp: float = field(default_factory=time.time)
 
 class TrafficAnalyzer(ScanModule):
-    """Network traffic analysis module"""
+    """Network traffic analysis engine"""
     
     def __init__(self):
         super().__init__()
         self.module_name = "traffic_analyzer"
-        self.capture_duration = config.network.traffic_capture_duration
-        self.max_threads = config.network.traffic_threads
-        self._stop_event = threading.Event()
-        self._capture_thread = None
+        self._active = False
+        self._socket = None
+        self._flows: Dict[Tuple, TrafficFlow] = {}
+        self._protocol_stats: Dict[str, ProtocolStats] = {}
+        self._alerts: List[TrafficAlert] = []
+        self._packet_count = 0
+        self._signatures = self._load_signatures()
         
-    def initialize(self) -> None:
-        """Initialize analyzer resources"""
-        logger.info(f"Initialized {self.module_name} with {self.max_threads} threads")
-        
-    def cleanup(self) -> None:
-        """Cleanup analyzer resources"""
-        self._stop_capture()
-        logger.info(f"Cleaned up {self.module_name}")
-        
-    def validate_target(self, target: ScanTarget) -> bool:
-        """Validate target is appropriate for traffic analysis"""
-        if not target.host:
-            return False
-        return NetworkHelpers.validate_ip_or_domain(target.host)
-        
-    def _capture_traffic(self, interface: str, duration: float) -> List[Any]:
-        """Capture network traffic on specified interface"""
-        packets = []
-        start_time = time.time()
-        
-        try:
-            # Note: Actual packet capture would use pcap or similar
-            # This is a simplified implementation
-            while not self._stop_event.is_set() and (time.time() - start_time) < duration:
-                # Simulate packet capture
-                time.sleep(0.1)
-                # In real implementation, would capture actual packets here
-                
-        except Exception as e:
-            logger.error(f"Traffic capture failed: {str(e)}")
-            
-        return packets
-        
-    def _analyze_packet(self, packet: Any) -> Dict[str, Any]:
-        """Analyze a single network packet"""
-        result = {
-            "protocol": ProtocolType.OTHER.name,
-            "src_ip": "",
-            "dst_ip": "",
-            "src_port": 0,
-            "dst_port": 0,
-            "size": 0,
-            "anomaly": False,
-            "timestamp": time.time()
+        # Initialize protocol decoders
+        self._decoders = {
+            dpkt.ethernet.ETH_TYPE_IP: self._process_ip_packet,
+            dpkt.ethernet.ETH_TYPE_ARP: self._process_arp_packet
         }
-        
+
+    def _load_signatures(self) -> Dict:
+        """Load threat signatures from file"""
         try:
-            # Parse packet using dpkt
-            eth = dpkt.ethernet.Ethernet(packet)
-            if isinstance(eth.data, dpkt.ip.IP):
-                ip = eth.data
-                result["src_ip"] = socket.inet_ntoa(ip.src)
-                result["dst_ip"] = socket.inet_ntoa(ip.dst)
-                result["size"] = ip.len
+            sig_path = Path(config.data_dir) / "traffic_signatures.json"
+            with open(sig_path, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load traffic signatures: {str(e)}")
+            return {}
+
+    async def start_capture(self, interface: str = "eth0", filter: str = "") -> bool:
+        """Start live traffic capture"""
+        if self._active:
+            logger.warning("Capture already running")
+            return False
+
+        try:
+            # Create raw socket
+            self._socket = socket.socket(
+                socket.AF_PACKET,
+                socket.SOCK_RAW,
+                socket.htons(0x0003)
+            )
+            self._socket.settimeout(1)
+            self._socket.bind((interface, 0))
+            
+            self._active = True
+            asyncio.create_task(self._capture_loop())
+            logger.info(f"Started traffic capture on {interface}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to start capture: {str(e)}")
+            self._socket = None
+            return False
+
+    async def _capture_loop(self) -> None:
+        """Main packet capture loop"""
+        while self._active:
+            try:
+                raw_packet = self._socket.recv(65535)
+                if raw_packet:
+                    await net_pool.submit(
+                        self._process_packet,
+                        raw_packet
+                    )
+            except socket.timeout:
+                continue
+            except Exception as e:
+                logger.error(f"Packet capture error: {str(e)}")
+                time.sleep(1)
+
+    async def _process_packet(self, raw_packet: bytes) -> None:
+        """Process individual network packet"""
+        try:
+            self._packet_count += 1
+            
+            # Decode Ethernet frame
+            eth = dpkt.ethernet.Ethernet(raw_packet)
+            
+            # Process based on protocol
+            decoder = self._decoders.get(eth.type)
+            if decoder:
+                decoder(eth)
                 
-                if isinstance(ip.data, dpkt.tcp.TCP):
-                    result["protocol"] = ProtocolType.TCP.name
-                    tcp = ip.data
-                    result["src_port"] = tcp.sport
-                    result["dst_port"] = tcp.dport
-                    
-                    # Check for HTTP
-                    if tcp.dport == 80 or tcp.sport == 80:
-                        try:
-                            http = dpkt.http.Request(tcp.data)
-                            result["protocol"] = ProtocolType.HTTP.name
-                        except:
-                            pass
-                            
-                elif isinstance(ip.data, dpkt.udp.UDP):
-                    result["protocol"] = ProtocolType.UDP.name
-                    udp = ip.data
-                    result["src_port"] = udp.sport
-                    result["dst_port"] = udp.dport
-                    
-                    # Check for DNS
-                    if udp.dport == 53 or udp.sport == 53:
-                        try:
-                            dns = dpkt.dns.DNS(udp.data)
-                            result["protocol"] = ProtocolType.DNS.name
-                        except:
-                            pass
-                            
-                # Add anomaly detection here
-                result["anomaly"] = self._detect_anomaly(result)
+            # Periodic analysis
+            if self._packet_count % 1000 == 0:
+                self._analyze_traffic()
                 
         except Exception as e:
-            logger.debug(f"Packet analysis error: {str(e)}")
-            
-        return result
+            logger.debug(f"Packet processing failed: {str(e)}")
+
+    def _process_ip_packet(self, eth: dpkt.ethernet.Ethernet) -> None:
+        """Process IP packet"""
+        ip = eth.data
+        protocol = ip.p
         
-    def _detect_anomaly(self, packet_info: Dict[str, Any]) -> bool:
-        """Detect anomalies in packet"""
-        # Example simple anomaly detection
-        if packet_info["size"] > 1500:  # Jumbo frames
-            return True
-        if packet_info["dst_port"] in [22, 3389] and packet_info["protocol"] != ProtocolType.TCP.name:
-            return True
-        return False
+        # Update protocol stats
+        proto_name = self._protocol_to_name(protocol)
+        if proto_name not in self._protocol_stats:
+            self._protocol_stats[proto_name] = ProtocolStats(proto_name)
+        self._protocol_stats[proto_name].total_packets += 1
+        self._protocol_stats[proto_name].total_bytes += len(ip)
         
-    def _analyze_traffic(self, packets: List[Any]) -> TrafficStats:
-        """Analyze captured traffic"""
-        stats = TrafficStats()
-        
-        with ThreadPoolExecutor(max_workers=self.max_threads) as executor:
-            futures = [executor.submit(self._analyze_packet, pkt) for pkt in packets]
-            
-            for future in as_completed(futures):
-                try:
-                    result = future.result()
-                    stats.packet_count += 1
-                    stats.byte_count += result["size"]
-                    stats.protocols[result["protocol"]] += 1
-                    stats.sources[result["src_ip"]] += 1
-                    stats.destinations[result["dst_ip"]] += 1
-                    
-                    if result["anomaly"]:
-                        stats.anomalies.append(result)
-                        
-                except Exception as e:
-                    logger.error(f"Traffic analysis failed: {str(e)}")
-                    
-        return stats
-        
-    def _stop_capture(self) -> None:
-        """Stop ongoing traffic capture"""
-        self._stop_event.set()
-        if self._capture_thread and self._capture_thread.is_alive():
-            self._capture_thread.join(timeout=5.0)
-            
-    def execute(self, target: ScanTarget) -> ScanResult:
-        """
-        Execute traffic analysis against target
-        
-        Args:
-            target: ScanTarget specifying host and interface
-            
-        Returns:
-            ScanResult with traffic analysis results
-        """
-        if not self.validate_target(target):
-            logger.error(f"Invalid scan target: {target.host}")
-            return ScanResult(
-                target=target,
-                data={"error": "Invalid target"},
-                status=ScanStatus.FAILED
+        # Handle TCP/UDP
+        if protocol in (dpkt.ip.IP_PROTO_TCP, dpkt.ip.IP_PROTO_UDP):
+            transport = ip.data
+            flow_key = (
+                socket.inet_ntoa(ip.src),
+                socket.inet_ntoa(ip.dst),
+                transport.sport,
+                transport.dport,
+                "tcp" if protocol == dpkt.ip.IP_PROTO_TCP else "udp"
             )
             
-        interface = target.metadata.get("interface", "eth0")
-        duration = target.metadata.get("duration", self.capture_duration)
+            # Update flow stats
+            if flow_key not in self._flows:
+                self._flows[flow_key] = TrafficFlow(*flow_key)
+                self._protocol_stats[proto_name].flows += 1
+                
+            flow = self._flows[flow_key]
+            flow.packets_sent += 1
+            flow.bytes_sent += len(transport.data)
+            flow.end_time = time.time()
+            
+            # Check for threats
+            self._detect_threats(flow, transport.data)
+            
+    def _process_arp_packet(self, eth: dpkt.ethernet.Ethernet) -> None:
+        """Process ARP packet"""
+        arp = eth.data
+        self._protocol_stats["arp"].total_packets += 1
         
-        logger.info(
-            f"Starting traffic analysis on {interface} for {duration} seconds "
-            f"(target: {target.host})"
+        # Detect ARP spoofing
+        if arp.op == dpkt.arp.ARP_OP_REPLY:
+            self._check_arp_spoofing(arp)
+
+    def _protocol_to_name(self, protocol: int) -> str:
+        """Convert protocol number to name"""
+        protocols = {
+            dpkt.ip.IP_PROTO_TCP: "tcp",
+            dpkt.ip.IP_PROTO_UDP: "udp",
+            dpkt.ip.IP_PROTO_ICMP: "icmp",
+            dpkt.arp.ARP_OP_REQUEST: "arp_request",
+            dpkt.arp.ARP_OP_REPLY: "arp_reply"
+        }
+        return protocols.get(protocol, f"proto_{protocol}")
+
+    def _detect_threats(self, flow: TrafficFlow, payload: bytes) -> None:
+        """Analyze traffic for malicious patterns"""
+        # Port scanning detection
+        if flow.packets_sent > 100 and flow.dst_port > flow.src_port:
+            self._create_alert(
+                "warning",
+                "scanning",
+                f"Possible port scanning from {flow.src_ip}",
+                {
+                    "src_ip": flow.src_ip,
+                    "port_range": f"{flow.src_port}-{flow.dst_port}",
+                    "packets": flow.packets_sent
+                }
+            )
+        
+        # Data exfiltration detection
+        if len(payload) > 1024 and flow.protocol == "tcp":
+            self._create_alert(
+                "critical",
+                "exfiltration",
+                f"Large data transfer from {flow.src_ip}",
+                {
+                    "src_ip": flow.src_ip,
+                    "bytes": len(payload),
+                    "protocol": flow.protocol
+                }
+            )
+        
+        # Signature-based detection
+        for sig in self._signatures.get("network", []):
+            if re.search(sig["pattern"], str(payload), re.IGNORECASE):
+                self._create_alert(
+                    sig["severity"],
+                    sig["category"],
+                    sig["description"],
+                    {
+                        "src_ip": flow.src_ip,
+                        "dst_ip": flow.dst_ip,
+                        "signature": sig["name"]
+                    }
+                )
+
+    def _check_arp_spoofing(self, arp: dpkt.arp.ARP) -> None:
+        """Detect ARP spoofing attempts"""
+        # Implement ARP cache verification logic
+        # This is a placeholder for actual ARP spoofing detection
+        pass
+
+    def _create_alert(self, severity: str, category: str, description: str, evidence: Dict) -> None:
+        """Record a security alert"""
+        alert = TrafficAlert(severity, category, description, evidence)
+        self._alerts.append(alert)
+        event_system.emit(
+            "traffic_alert",
+            severity=severity,
+            category=category,
+            description=description,
+            evidence=evidence
         )
+        logger.warning(f"Traffic alert: {description}")
+
+    def _analyze_traffic(self) -> None:
+        """Periodic traffic analysis"""
+        # Detect DDoS patterns
+        total_pps = sum(ps.total_packets for ps in self._protocol_stats.values())
+        if total_pps > 10000:  # 10k packets/sec threshold
+            self._create_alert(
+                "critical",
+                "dos",
+                "Possible DDoS attack detected",
+                {
+                    "packets_per_second": total_pps,
+                    "top_protocols": sorted(
+                        self._protocol_stats.items(),
+                        key=lambda x: x[1].total_packets,
+                        reverse=True
+                    )[:3]
+                }
+            )
         
+        # Detect unusual protocols
+        for proto, stats in self._protocol_stats.items():
+            if proto not in ["tcp", "udp", "icmp", "arp"] and stats.total_packets > 100:
+                self._create_alert(
+                    "warning",
+                    "unusual_protocol",
+                    f"Unusual protocol activity: {proto}",
+                    {
+                        "protocol": proto,
+                        "packets": stats.total_packets,
+                        "bytes": stats.total_bytes
+                    }
+                )
+
+    async def stop_capture(self) -> Dict[str, Any]:
+        """Stop traffic capture and return results"""
+        self._active = False
+        if self._socket:
+            self._socket.close()
+            self._socket = None
+            
+        # Final analysis
+        self._analyze_traffic()
+        
+        return {
+            "duration": time.time() - min(
+                (f.start_time for f in self._flows.values()),
+                default=time.time()
+            ),
+            "total_packets": self._packet_count,
+            "flows": len(self._flows),
+            "protocols": self._protocol_stats,
+            "alerts": self._alerts
+        }
+
+    def execute(self, target: ScanTarget) -> Dict[str, Any]:
+        """Execute traffic analysis (interface for scan engine)"""
         try:
-            # Start capture
-            self._stop_event.clear()
-            self._capture_thread = threading.Thread(
-                target=self._capture_traffic,
-                args=(interface, duration),
-                daemon=True
-            )
-            self._capture_thread.start()
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
             
-            # Wait for capture to complete
-            self._capture_thread.join()
+            # Start capture with default interface
+            loop.run_until_complete(self.start_capture())
             
-            # Analyze captured traffic
-            packets = []  # In real implementation, would use captured packets
-            stats = self._analyze_traffic(packets)
+            # Run for configured duration
+            time.sleep(config.traffic.capture_duration)
             
-            return ScanResult(
-                target=target,
-                data={
-                    "stats": {
-                        "packet_count": stats.packet_count,
-                        "byte_count": stats.byte_count,
-                        "protocols": dict(stats.protocols),
-                        "top_sources": dict(sorted(stats.sources.items(), key=lambda x: x[1], reverse=True)[:5]),
-                        "top_destinations": dict(sorted(stats.destinations.items(), key=lambda x: x[1], reverse=True)[:5]),
-                        "anomaly_count": len(stats.anomalies)
-                    },
-                    "anomalies": stats.anomalies[:100]  # Limit number of returned anomalies
-                },
-                status=ScanStatus.COMPLETED
-            )
+            # Stop and get results
+            results = loop.run_until_complete(self.stop_capture())
+            loop.close()
             
+            return {
+                "target": target.host,
+                "results": results
+            }
         except Exception as e:
-            logger.error(f"Traffic analysis failed on {target.host}: {str(e)}", exc_info=True)
-            return ScanResult(
-                target=target,
-                data={"error": str(e)},
-                status=ScanStatus.FAILED
-            )
+            logger.error(f"Traffic analysis failed: {str(e)}")
+            return {"error": str(e)}
+
+    def shutdown(self) -> None:
+        """Cleanup resources"""
+        if self._active:
+            asyncio.run(self.stop_capture())
+        logger.info("Traffic analyzer shutdown complete")
 
 # Module registration
 def init_module():
@@ -262,6 +359,5 @@ def init_module():
 
 # Example usage:
 # analyzer = TrafficAnalyzer()
-# target = ScanTarget(host="example.com", metadata={"interface": "eth0", "duration": 60})
-# result = analyzer.execute(target)
-# print(json.dumps(result.data, indent=2))
+# results = analyzer.execute(ScanTarget(host="eth0"))
+# analyzer.shutdown()
